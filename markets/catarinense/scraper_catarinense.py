@@ -1,5 +1,5 @@
 """
-scraper_araujo.py — Scraper for Drogaria Araujo (https://www.drogal.com.br)
+scraper_catarinense.py — Scraper for Drogaria Catarinense (https://www.drogal.com.br)
 
 Platform  : VTEX IO
 API       : /api/catalog_system/pub/products/search/
@@ -18,17 +18,15 @@ Category note:
     No leaf category exceeds the VTEX 2550 cap (verified 2026-05-20).
 
 Usage:
-    python -m markets.paguemenos.scraper_araujo              # scrape -> DB
-    python -m markets.paguemenos.scraper_araujo --limit 500  # test run -> DB
-    python -m markets.paguemenos.scraper_araujo --csv        # scrape -> DB + CSV
+    python -m markets.paguemenos.scraper_catarinense              # scrape -> DB
+    python -m markets.paguemenos.scraper_catarinense --limit 500  # test run -> DB
+    python -m markets.paguemenos.scraper_catarinense --csv        # scrape -> DB + CSV
 """
 
 import csv
 import re
 import sys
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -36,29 +34,16 @@ import requests
 
 sys.stdout.reconfigure(line_buffering=True)
 
-BASE_URL  = "https://www.araujo.com.br"                 # storefront (for product_url); Akamai-blocked
-API_HOST  = "https://araujo.vtexcommercestable.com.br"  # VTEX backend host — bypasses the storefront Akamai WAF
-STORE_ID  = "araujo"
+BASE_URL  = "https://www.drogariacatarinense.com.br"
+STORE_ID  = "catarinense"
 PAGE_SIZE = 50    # VTEX max per request
 VTEX_CAP  = 2549  # VTEX hard ceiling: _to cannot exceed this
-DELAY     = 0.2   # seconds between requests (per worker, between pages of one category)
-WORKERS   = 8     # parallel leaf-category walkers (873 leaves -> ~20-30min vs ~161min sequential)
-
-# One requests.Session per worker thread (Session isn't safe to share across threads).
-_thread_local = threading.local()
-
-
-def _worker_session() -> requests.Session:
-    s = getattr(_thread_local, "session", None)
-    if s is None:
-        s = _make_session()
-        _thread_local.session = s
-    return s
+DELAY     = 0.2   # seconds between requests
 
 GOOGLEBOT_UA = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
 
 # Skip internal/empty categories
-_SKIP_IDS: set = set()
+_SKIP_IDS: set = set()   # id=1 is a real dept (Medicamentos); walk all leaves
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -89,7 +74,7 @@ def fetch_category_nodes(session: requests.Session) -> List[Dict]:
     Short-form fq=C:/{id}/ only works for top-level departments (100, 200, ...).
     """
     r = session.get(
-        f"{API_HOST}/api/catalog_system/pub/category/tree/5",
+        f"{BASE_URL}/api/catalog_system/pub/category/tree/5",
         timeout=25,
     )
     r.raise_for_status()
@@ -144,7 +129,7 @@ def _fetch_page(
     """Returns (items, total_in_category). Handles rate-limit retry."""
     to_ = min(from_ + PAGE_SIZE - 1, VTEX_CAP)
     r = session.get(
-        f"{API_HOST}/api/catalog_system/pub/products/search/",
+        f"{BASE_URL}/api/catalog_system/pub/products/search/",
         params={"fq": fq, "_from": from_, "_to": to_},
         timeout=30,
     )
@@ -232,111 +217,92 @@ def _standardize(raw: Dict, cat_label: str) -> Optional[Dict]:
 # Main scrape
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _scrape_category(cat: Dict) -> List[Dict]:
+def scrape(db, limit: Optional[int] = None) -> Dict:
     """
-    Walk all pages of ONE leaf category (runs in a worker thread).
-    Returns standardized offers with a per-category dedup only — global dedup and
-    all DB writes happen single-threaded in scrape() below.
+    Scrape all leaf categories and save to DB after each one.
+    Flushes per-category offer list from memory after each save.
+    Returns cumulative stats dict.
     """
-    session   = _worker_session()
-    fq        = cat["fq"]
-    cat_label = cat["full_path"]
-    from_     = 0
-    cat_total = None
-    local_seen: set = set()
-    offers: List[Dict] = []
+    import gc
 
-    while True:
-        if from_ > VTEX_CAP:
-            break
-        page, total = _fetch_page(session, fq, from_)
-        if cat_total is None and total:
-            cat_total = total
-        if not page:
-            break
-
-        for raw in page:
-            pid = str(raw.get("productId", "")).strip()
-            if not pid or pid in local_seen:
-                continue
-            local_seen.add(pid)
-            offer = _standardize(raw, cat_label)
-            if offer:
-                offers.append(offer)
-
-        if len(page) < PAGE_SIZE:
-            break
-        from_ += PAGE_SIZE
-        if from_ > VTEX_CAP and cat_total and cat_total > VTEX_CAP:
-            break
-        time.sleep(DELAY)
-
-    return offers
-
-
-def scrape(db, limit: Optional[int] = None, workers: int = WORKERS) -> Dict:
-    """
-    Scrape all leaf categories in parallel (each worker walks one category's pages),
-    while global dedup + batched DB saves stay on the main thread (crash-safe: every
-    BATCH_SIZE products is committed via upsert, so a mid-run failure keeps what's saved).
-    """
-    session = _make_session()
-    print("Fetching category tree...")
-    leaves = fetch_category_nodes(session)
-    print(f"Found {len(leaves)} leaf categories to scrape with {workers} workers.")
-
+    session  = _make_session()
     seen_ids: set = set()
-    batch: List[Dict] = []
-    BATCH_SIZE = 500
     total_saved = total_upserted = total_history = total_skipped = 0
 
-    def _flush() -> None:
-        nonlocal total_saved, total_upserted, total_history, total_skipped
-        if not batch:
-            return
-        stats = db.save(batch, verbose=False)
-        total_saved    += stats["upserted"]
-        total_upserted += stats["upserted"]
-        total_history  += stats["history_inserted"]
-        total_skipped  += stats["skipped_zero"]
-        print(f"    -> saved {stats['upserted']} | price changes {stats['history_inserted']} | cumul {total_saved}")
-        batch.clear()
+    print("Fetching category tree...")
+    leaves = fetch_category_nodes(session)
+    print(f"Found {len(leaves)} leaf categories to scrape.")
 
-    done = 0
-    ex = ThreadPoolExecutor(max_workers=workers)
-    futures = {ex.submit(_scrape_category, cat): cat for cat in leaves}
-    try:
-        for fut in as_completed(futures):
-            cat = futures[fut]
-            done += 1
-            try:
-                cat_offers = fut.result()
-            except Exception as exc:
-                print(f"  ERROR {cat['full_path'][:50]}: {exc.__class__.__name__}: {exc}")
-                continue
+    for cat in leaves:
+        fq        = cat["fq"]
+        cat_label = cat["full_path"]
+        from_     = 0
+        cat_total = None
+        cat_offers: List[Dict] = []
 
-            new = 0
-            for offer in cat_offers:
-                pid = offer["product_id"]
+        while True:
+            if from_ > VTEX_CAP:
+                print(f"  WARNING: {cat_label} hit VTEX cap at {VTEX_CAP}")
+                break
+
+            page, total = _fetch_page(session, fq, from_)
+            if cat_total is None and total:
+                cat_total = total
+            if not page:
+                break
+
+            new_this_page = 0
+            for raw in page:
+                pid = str(raw.get("productId", "")).strip()
                 if not pid or pid in seen_ids:
                     continue
                 seen_ids.add(pid)
-                batch.append(offer)
-                new += 1
+                offer = _standardize(raw, cat_label)
+                if offer:
+                    cat_offers.append(offer)
+                    new_this_page += 1
 
-            if new or done % 25 == 0:
-                print(f"  [{done:>3}/{len(leaves)}] {cat['full_path'][:45]:<45} +{new:<4} unique={len(seen_ids)}")
+            if new_this_page > 0 or from_ == 0:
+                print(
+                    f"  {cat_label[:50]:<50}  from={from_:>5}  "
+                    f"got={len(page)}  new={new_this_page}  "
+                    f"total={cat_total or '?':>5}  "
+                    f"saved={total_saved}"
+                )
 
-            if len(batch) >= BATCH_SIZE:
-                _flush()
-
-            if limit and len(seen_ids) >= limit:
-                print(f"Limit {limit} reached — stopping.")
+            if len(page) < PAGE_SIZE:
                 break
-    finally:
-        ex.shutdown(wait=False, cancel_futures=True)
 
-    _flush()
+            from_ += PAGE_SIZE
+
+            if from_ > VTEX_CAP and cat_total and cat_total > VTEX_CAP:
+                print(
+                    f"  WARNING: {cat_label} has {cat_total} products "
+                    f"but VTEX caps at {VTEX_CAP}"
+                )
+                break
+
+            time.sleep(DELAY)
+
+            if limit and total_saved + len(cat_offers) >= limit:
+                break
+
+        # Save this category's batch and free memory
+        if cat_offers:
+            stats = db.save(cat_offers, verbose=False)
+            total_saved    += stats["upserted"]
+            total_upserted += stats["upserted"]
+            total_history  += stats["history_inserted"]
+            total_skipped  += stats["skipped_zero"]
+            print(f"    -> saved {stats['upserted']} | price changes {stats['history_inserted']} | cumul {total_saved}")
+            cat_offers.clear()
+            gc.collect()
+
+        time.sleep(DELAY)
+
+        if limit and total_saved >= limit:
+            print(f"Limit {limit} reached — stopping.")
+            break
 
     return {"upserted": total_upserted, "history_inserted": total_history,
             "skipped_zero": total_skipped, "total_unique": total_saved}
@@ -370,7 +336,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Scrape Drogaria Araujo -> PostgreSQL (DB is always written; CSV is optional)"
+        description="Scrape Drogaria Catarinense -> PostgreSQL (DB is always written; CSV is optional)"
     )
     parser.add_argument("--limit",  type=int, default=None, help="Stop after N products (test)")
     parser.add_argument("--csv",    action="store_true",    help="Also export a CSV file after scrape")
@@ -378,10 +344,10 @@ if __name__ == "__main__":
     parser.add_argument("--env",    type=str, default=".env", help=".env file path")
     args = parser.parse_args()
 
-    from db.db_manager import AraujoDB, load_env
+    from db.db_manager import CatarinenseDB, load_env
     load_env(args.env)
 
-    db    = AraujoDB()
+    db    = CatarinenseDB()
     stats = scrape(db, limit=args.limit)
     db.close()
 
@@ -392,6 +358,6 @@ if __name__ == "__main__":
 
     if args.csv or args.output:
         output_dir = args.output or "."
-        db2 = AraujoDB()
+        db2 = CatarinenseDB()
         db2.export(output_dir, tables=["offers"])
         db2.close()
